@@ -1,0 +1,119 @@
+# Fork-only validation for GH-3336. Not part of the upstream change.
+name: validate GH-3336
+
+on:
+  push:
+    branches:
+      - 'validate/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.variant }}, hadoop ${{ matrix.hadoop }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [fix, master-reader]
+        # 3.3.0 is the version the build pins and has no vectored IO; 3.4.2 has it.
+        hadoop: ['3.3.0', '3.4.2']
+    env:
+      BASE_SHA: c972bd040f5448ba551877e87941ff20fe96cb9f
+      READER: parquet-hadoop/src/main/java/org/apache/parquet/hadoop/ParquetFileReader.java
+      MVN_ARGS: -B -ntp -Djava.version=17 -Dhadoop.version=${{ matrix.hadoop }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Use master ParquetFileReader.java (fail-before variant)
+        if: matrix.variant == 'master-reader'
+        run: |
+          git checkout "$BASE_SHA" -- "$READER"
+          git diff --stat --cached
+      - name: Set up JDK 17
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Install thrift
+        run: bash dev/ci-before_install.sh
+      - name: Install modules
+        run: ./mvnw $MVN_ARGS -pl parquet-hadoop -am install -DskipTests -Dmaven.javadoc.skip=true -Dsource.skip=true -Dspotless.check.skip=true
+      - name: Hadoop on the test classpath
+        run: ./mvnw $MVN_ARGS -pl parquet-hadoop dependency:list -DincludeGroupIds=org.apache.hadoop | grep -E "hadoop-(client|common|client-api)" || true
+      - name: New test
+        run: |
+          set +e
+          ./mvnw $MVN_ARGS -pl parquet-hadoop test -Dtest=TestOldWriterDictionaryChunks -Dsurefire.failIfNoSpecifiedTests=false -DtrimStackTrace=false 2>&1 | tee new-test.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "maven exit code: $rc"
+          X=parquet-hadoop/target/surefire-reports/TEST-org.apache.parquet.hadoop.TestOldWriterDictionaryChunks.xml
+          test -f "$X" || { echo "no surefire report, the build failed before the test ran"; exit 1; }
+          echo "---- per test result ----"
+          grep -E "<testcase|<failure|<error" "$X" | cut -c1-300
+          echo "---- first stack lines of each failure ----"
+          grep -A 6 -E "<failure|<error" "$X" | cut -c1-200 | head -120
+          if [ "${{ matrix.variant }}" = "fix" ]; then
+            test "$rc" -eq 0
+          else
+            test "$rc" -ne 0
+            grep -q -E "<failure|<error" "$X"
+          fi
+      - name: Related tests
+        run: |
+          set +e
+          ./mvnw $MVN_ARGS -pl parquet-hadoop test '-Dtest=TestColumnIndexFiltering,TestParquetFileReader*,TestParquetReader*,TestInputFormatColumnProjection,TestParquetFileWriter,TestVectorIoBridge,TestFileRangeBridge,TestColumnChunkPageWriteStore' -Dsurefire.failIfNoSpecifiedTests=false 2>&1 | tee related.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "---- related tests summary (${{ matrix.variant }}, hadoop ${{ matrix.hadoop }}) exit code $rc ----"
+          grep -E "Tests run: [0-9]+, Failures: [0-9]+, Errors: [0-9]+, Skipped: [0-9]+$" related.log | tail -1
+          echo "errors by test method:"
+          grep -E "^\[ERROR\]   Test" related.log | sed -E 's/^\[ERROR\]   ([A-Za-z]+)\.([A-Za-z]+).*(LeakedByteBuffer|[A-Za-z]*Exception).*/\1.\2 \3/' | sort | uniq -c
+          # the pinned hadoop 3.3.0 leg must be clean; the 3.4.2 leg is informative (compare fix with master-reader)
+          if [ "${{ matrix.hadoop }}" = "3.3.0" ]; then test "$rc" -eq 0; fi
+
+  module-tests:
+    name: whole parquet-hadoop module, fix, hadoop 3.3.0
+    runs-on: ubuntu-latest
+    env:
+      MVN_ARGS: -B -ntp -Djava.version=17 -Dhadoop.version=3.3.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up JDK 17
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Install thrift
+        run: bash dev/ci-before_install.sh
+      - name: Install modules
+        run: ./mvnw $MVN_ARGS -pl parquet-hadoop -am install -DskipTests -Dmaven.javadoc.skip=true -Dsource.skip=true -Dspotless.check.skip=true
+      - name: All parquet-hadoop tests
+        run: ./mvnw $MVN_ARGS -pl parquet-hadoop test
+
+  format:
+    name: spotless
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up JDK 17
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: spotless:apply
+        run: ./mvnw -B -ntp -pl parquet-hadoop spotless:apply
+      - name: Show what spotless changed
+        run: |
+          git diff --stat
+          git diff
+          git diff --quiet
