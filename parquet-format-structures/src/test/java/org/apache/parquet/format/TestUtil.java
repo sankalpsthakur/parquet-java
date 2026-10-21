@@ -27,6 +27,10 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.List;
 import org.apache.parquet.format.Util.DefaultFileMetaDataConsumer;
 import org.junit.jupiter.api.Test;
 
@@ -102,5 +106,83 @@ public class TestUtil {
 
   private ByteArrayInputStream in(ByteArrayOutputStream baos) {
     return new ByteArrayInputStream(baos.toByteArray());
+  }
+
+  /** Remembers the plaintext it is given and returns it as it is. */
+  private static class CapturingEncryptor implements BlockCipher.Encryptor {
+    private byte[] plaintext;
+
+    @Override
+    public byte[] encrypt(byte[] plaintext, byte[] AAD) {
+      this.plaintext = plaintext;
+      return plaintext;
+    }
+  }
+
+  private interface ModuleWriter {
+    void write(OutputStream out, BlockCipher.Encryptor encryptor, byte[] aad) throws IOException;
+  }
+
+  /**
+   * An Encryptor is given the whole plaintext, so a module must be encrypted as the bytes thrift
+   * wrote and not as the larger buffer they were written into. The padding is encrypted too,
+   * and readers that find the end of a module by how much thrift consumed lose their place.
+   */
+  private static void assertEncryptsOnlyTheSerializedBytes(ModuleWriter writer) throws IOException {
+    ByteArrayOutputStream unencrypted = new ByteArrayOutputStream();
+    writer.write(unencrypted, null, null);
+
+    CapturingEncryptor encryptor = new CapturingEncryptor();
+    writer.write(new ByteArrayOutputStream(), encryptor, new byte[] {1, 2, 3});
+
+    assertThat(encryptor.plaintext).isEqualTo(unencrypted.toByteArray());
+  }
+
+  @Test
+  public void testEncryptedModulesAreNotPadded() throws IOException {
+    // 8 bytes, far below the initial 100 byte buffer
+    PageHeader pageHeader = new PageHeader(PageType.DATA_PAGE, 100, 50);
+    assertEncryptsOnlyTheSerializedBytes(
+        (out, encryptor, aad) -> Util.writePageHeader(pageHeader, out, encryptor, aad));
+
+    BloomFilterHeader bloomFilterHeader = new BloomFilterHeader(
+        1024,
+        BloomFilterAlgorithm.BLOCK(new SplitBlockAlgorithm()),
+        BloomFilterHash.XXHASH(new XxHash()),
+        BloomFilterCompression.UNCOMPRESSED(new Uncompressed()));
+    assertEncryptsOnlyTheSerializedBytes(
+        (out, encryptor, aad) -> Util.writeBloomFilterHeader(bloomFilterHeader, out, encryptor, aad));
+
+    ColumnIndex columnIndex = new ColumnIndex(
+        asList(false, true),
+        asList(ByteBuffer.wrap(new byte[] {1}), ByteBuffer.wrap(new byte[0])),
+        asList(ByteBuffer.wrap(new byte[] {9}), ByteBuffer.wrap(new byte[0])),
+        BoundaryOrder.ASCENDING);
+    assertEncryptsOnlyTheSerializedBytes(
+        (out, encryptor, aad) -> Util.writeColumnIndex(columnIndex, out, encryptor, aad));
+
+    ColumnMetaData columnMetaData = new ColumnMetaData(
+        Type.INT64, asList(Encoding.PLAIN, Encoding.RLE), asList("a", "b"), CompressionCodec.SNAPPY, 10, 100, 50, 4);
+    assertEncryptsOnlyTheSerializedBytes(
+        (out, encryptor, aad) -> Util.writeColumnMetaData(columnMetaData, out, encryptor, aad));
+
+    // larger than the initial buffer, which then grows
+    List<PageLocation> locations = new ArrayList<>();
+    for (int i = 0; i < 100; i++) {
+      locations.add(new PageLocation(4 + i * 1000L, 1000, i * 100L));
+    }
+    OffsetIndex offsetIndex = new OffsetIndex(locations);
+    assertEncryptsOnlyTheSerializedBytes(
+        (out, encryptor, aad) -> Util.writeOffsetIndex(offsetIndex, out, encryptor, aad));
+
+    FileMetaData fileMetaData = new FileMetaData(
+        1,
+        asList(new SchemaElement("foo")),
+        10,
+        asList(
+            new RowGroup(asList(new ColumnChunk(0), new ColumnChunk(1)), 10, 5),
+            new RowGroup(asList(new ColumnChunk(2), new ColumnChunk(3)), 11, 5)));
+    assertEncryptsOnlyTheSerializedBytes(
+        (out, encryptor, aad) -> Util.writeFileMetaData(fileMetaData, out, encryptor, aad));
   }
 }

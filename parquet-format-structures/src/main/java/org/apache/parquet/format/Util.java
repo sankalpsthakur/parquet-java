@@ -37,6 +37,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.List;
 import org.apache.parquet.format.event.Consumers.Consumer;
 import org.apache.parquet.format.event.Consumers.DelegatingFieldConsumer;
@@ -477,7 +478,9 @@ public class Util {
     // Serialize and encrypt the structure
     try (TMemoryBuffer thriftMemoryBuffer = new TMemoryBuffer(INIT_MEM_ALLOC_ENCR_BUFFER)) {
       tbase.write(new InterningProtocol(new TCompactProtocol(thriftMemoryBuffer)));
-      byte[] encryptedBuffer = encryptor.encrypt(thriftMemoryBuffer.getArray(), AAD);
+      // getArray() is the whole backing buffer, which is longer than what was written
+      byte[] serialized = Arrays.copyOf(thriftMemoryBuffer.getArray(), thriftMemoryBuffer.length());
+      byte[] encryptedBuffer = encryptor.encrypt(serialized, AAD);
       to.write(encryptedBuffer);
     } catch (TException e) {
       throw new IOException("can not write " + tbase, e);
