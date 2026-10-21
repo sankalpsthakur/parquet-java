@@ -1,0 +1,106 @@
+# Fork-only validation for the encrypted thrift module padding change. Not part of the upstream change.
+name: validate arrow-parquet-p2
+
+on:
+  push:
+    branches:
+      - 'validate/arrow-parquet-p2-*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: TestUtil, ${{ matrix.variant }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [fix, master-util]
+    env:
+      BASE_SHA: c972bd040f5448ba551877e87941ff20fe96cb9f
+      UTIL: parquet-format-structures/src/main/java/org/apache/parquet/format/Util.java
+      MVN_ARGS: -B -ntp -Djava.version=17
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Use master Util.java (fail-before variant)
+        if: matrix.variant == 'master-util'
+        run: |
+          git checkout "$BASE_SHA" -- "$UTIL"
+          git diff --stat --cached
+      - name: Set up JDK 17
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Install thrift
+        run: bash dev/ci-before_install.sh
+      - name: TestUtil
+        run: |
+          set +e
+          ./mvnw $MVN_ARGS -pl parquet-format-structures test -Dtest=TestUtil -DtrimStackTrace=false 2>&1 | tee test.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "maven exit code: $rc"
+          X=parquet-format-structures/target/surefire-reports/TEST-org.apache.parquet.format.TestUtil.xml
+          test -f "$X" || { echo "no surefire report, the build failed before the test ran"; exit 1; }
+          echo "---- per test result ----"
+          grep -E "<testcase|<failure|<error" "$X" | cut -c1-300
+          echo "---- first lines of each failure ----"
+          grep -A 3 -E "<failure|<error" "$X" | cut -c1-400 | head -40
+          if [ "${{ matrix.variant }}" = "fix" ]; then
+            test "$rc" -eq 0
+          else
+            test "$rc" -ne 0
+            # the new test, and only it, fails on master
+            test "$(grep -c -E '<failure|<error' "$X")" -eq 1
+            grep -B 1 -E "<failure|<error" "$X" | grep -q testEncryptedModulesAreNotPadded
+          fi
+
+  encryption:
+    name: parquet-hadoop encryption tests, fix
+    runs-on: ubuntu-latest
+    env:
+      MVN_ARGS: -B -ntp -Djava.version=17
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up JDK 17
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Install thrift
+        run: bash dev/ci-before_install.sh
+      - name: Install modules
+        run: ./mvnw $MVN_ARGS -pl parquet-hadoop -am install -DskipTests -Dmaven.javadoc.skip=true -Dsource.skip=true -Dspotless.check.skip=true
+      - name: Encryption round trips with the real ciphers
+        run: >
+          ./mvnw $MVN_ARGS -pl parquet-hadoop test
+          '-Dtest=TestPropertiesDrivenEncryption,TestEncryptionOptions,SchemaControlEncryptionTest,ColumnEncryptorTest,ParquetRewriterTest,KeyToolkitTest,TestKmsUrlRead,TestBloomFiltering,TestColumnIndexFiltering,TestParquetWriter'
+          -Dsurefire.failIfNoSpecifiedTests=false
+
+  format:
+    name: spotless
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up JDK 17
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: spotless:apply
+        run: ./mvnw -B -ntp -pl parquet-format-structures spotless:apply
+      - name: Show what spotless changed
+        run: |
+          git diff --stat
+          git diff
+          git diff --quiet
