@@ -162,7 +162,14 @@ public class TestUtil {
         (out, encryptor, aad) -> Util.writeColumnIndex(columnIndex, out, encryptor, aad));
 
     ColumnMetaData columnMetaData = new ColumnMetaData(
-        Type.INT64, asList(Encoding.PLAIN, Encoding.RLE), asList("a", "b"), CompressionCodec.SNAPPY, 10, 100, 50, 4);
+        Type.INT64,
+        asList(Encoding.PLAIN, Encoding.RLE),
+        asList("a", "b"),
+        CompressionCodec.SNAPPY,
+        10,
+        100,
+        50,
+        4);
     assertEncryptsOnlyTheSerializedBytes(
         (out, encryptor, aad) -> Util.writeColumnMetaData(columnMetaData, out, encryptor, aad));
 
