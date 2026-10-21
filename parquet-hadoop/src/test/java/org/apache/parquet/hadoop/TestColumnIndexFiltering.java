@@ -352,7 +352,9 @@ public class TestColumnIndexFiltering {
   private static void writePhoneBookToFile(
       Path file, WriterVersion parquetVersion, FileEncryptionProperties encryptionProperties) throws IOException {
     int pageSize = DATA.size() / 10; // Ensure that several pages will be created
-    int rowGroupSize = pageSize * 6 * 5; // Ensure that there are more row-groups created
+    // Ensure that there are more row-groups created. Where they end decides which pages the filters in the tests
+    // below can drop, which in turn depends on the size of the encrypted page headers.
+    int rowGroupSize = pageSize * 6 * 6;
 
     try (TrackingByteBufferAllocator allocator = TrackingByteBufferAllocator.wrap(new HeapByteBufferAllocator())) {
       PhoneBookWriter.write(

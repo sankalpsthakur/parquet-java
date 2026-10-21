@@ -85,51 +85,6 @@ jobs:
           '-Dtest=TestPropertiesDrivenEncryption,TestEncryptionOptions,SchemaControlEncryptionTest,ColumnEncryptorTest,ParquetRewriterTest,KeyToolkitTest,TestKmsUrlRead,TestBloomFiltering,TestColumnIndexFiltering,TestParquetWriter'
           -Dsurefire.failIfNoSpecifiedTests=false
 
-  layout:
-    name: TestColumnIndexFiltering row group size, ${{ matrix.variant }}
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        variant: [fix, master-util]
-    env:
-      BASE_SHA: c972bd040f5448ba551877e87941ff20fe96cb9f
-      UTIL: parquet-format-structures/src/main/java/org/apache/parquet/format/Util.java
-      TEST: parquet-hadoop/src/test/java/org/apache/parquet/hadoop/TestColumnIndexFiltering.java
-      MVN_ARGS: -B -ntp -Djava.version=17
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Use master Util.java (fail-before variant)
-        if: matrix.variant == 'master-util'
-        run: |
-          git checkout "$BASE_SHA" -- "$UTIL"
-          git diff --stat --cached
-      - name: Set up JDK 17
-        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
-        with:
-          distribution: temurin
-          java-version: '17'
-      - name: Install thrift
-        run: bash dev/ci-before_install.sh
-      - name: Install modules
-        run: ./mvnw $MVN_ARGS -pl parquet-hadoop -am install -DskipTests -Dmaven.javadoc.skip=true -Dsource.skip=true -Dspotless.check.skip=true
-      - name: Try row group sizes
-        run: |
-          for m in 30 25 28 29 31 32 35 40; do
-            git checkout -- "$TEST"
-            sed -i "s/pageSize \* 6 \* 5;/pageSize * $m;/" "$TEST"
-            grep -n "int rowGroupSize" "$TEST"
-            set +e
-            ./mvnw $MVN_ARGS -pl parquet-hadoop test -Dtest=TestColumnIndexFiltering -Dsurefire.failIfNoSpecifiedTests=false > "run-$m.log" 2>&1
-            rc=$?
-            set -e
-            echo "RESULT variant=${{ matrix.variant }} rowGroupSize=pageSize*$m exit=$rc: $(grep -E 'Tests run: [0-9]+, Failures: [0-9]+, Errors: [0-9]+, Skipped: [0-9]+$' "run-$m.log" | tail -1)"
-            grep -E "^\[ERROR\]   TestColumnIndexFiltering" "run-$m.log" | head -6 || true
-          done
-
   module-tests:
     name: whole parquet-hadoop module, fix
     runs-on: ubuntu-latest
