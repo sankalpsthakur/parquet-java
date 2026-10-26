@@ -351,7 +351,9 @@ public class TestCapacityByteArrayOutputStream {
     try (TrackingByteBufferAllocator tracking = TrackingByteBufferAllocator.wrap(inner);
         CapacityByteArrayOutputStream cbaos = new CapacityByteArrayOutputStream(8, 1000000, tracking)) {
       byte[] expected = byteRange(0, 40);
-      cbaos.write(expected);
+      for (byte b : expected) {
+        cbaos.write(b);
+      }
       assertThat(cbaos.size()).isEqualTo(expected.length);
       assertThat(cbaos.getSlabCount()).isGreaterThan(1);
 
@@ -377,7 +379,9 @@ public class TestCapacityByteArrayOutputStream {
   public void testWriteToUsesRecordedSizeWhenFinishedSlabPositionIsRewound() throws Throwable {
     try (CapacityByteArrayOutputStream cbaos = newCapacityBAOS(8)) {
       byte[] expected = byteRange(0, 40);
-      cbaos.write(expected);
+      for (byte b : expected) {
+        cbaos.write(b);
+      }
       List<ByteBuffer> slabs = cbaos.getSlabs();
       assertThat(slabs.size()).isGreaterThan(2);
 
@@ -394,7 +398,9 @@ public class TestCapacityByteArrayOutputStream {
   public void testWriteIntoDoesNotMutateSlabs() throws Throwable {
     try (CapacityByteArrayOutputStream cbaos = newCapacityBAOS(8)) {
       byte[] expected = byteRange(0, 40);
-      cbaos.write(expected);
+      for (byte b : expected) {
+        cbaos.write(b);
+      }
 
       ByteBuffer first = ByteBuffer.allocate(expected.length);
       cbaos.writeInto(first);
