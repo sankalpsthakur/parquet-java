@@ -22,9 +22,13 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.List;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 public class TestCapacityByteArrayOutputStream {
 
@@ -302,6 +306,115 @@ public class TestCapacityByteArrayOutputStream {
       for (int i = 0; i < values.length; i++) {
         assertThat(readLongLE(bytes, i * 8)).as("value at index " + i).isEqualTo(values[i]);
       }
+    }
+  }
+
+  @Test
+  public void testWriteIntSpansSlabBoundary() throws Throwable {
+    // 5-byte slabs: first int fits, second int has 1 byte remaining and must span
+    try (CapacityByteArrayOutputStream cbaos = newCapacityBAOS(5)) {
+      cbaos.writeInt(0x01020304);
+      cbaos.writeInt(0x05060708);
+      assertThat(cbaos.size()).isEqualTo(8);
+
+      byte[] bytes = BytesInput.from(cbaos).toByteArray();
+      assertThat(bytes).hasSize(8);
+      assertThat(readIntLE(bytes, 0)).isEqualTo(0x01020304);
+      assertThat(readIntLE(bytes, 4)).isEqualTo(0x05060708);
+
+      cbaos.setByte(0, (byte) 0xFF);
+      cbaos.setByte(4, (byte) 0xFE);
+      bytes = BytesInput.from(cbaos).toByteArray();
+      assertThat(bytes[0] & 0xFF).isEqualTo(0xFF);
+      assertThat(bytes[4] & 0xFF).isEqualTo(0xFE);
+    }
+  }
+
+  @Test
+  public void testWriteLongSpansSlabBoundary() throws Throwable {
+    try (CapacityByteArrayOutputStream cbaos = newCapacityBAOS(5)) {
+      cbaos.writeLong(0x0102030405060708L);
+      cbaos.writeLong(0x1112131415161718L);
+      assertThat(cbaos.size()).isEqualTo(16);
+
+      byte[] bytes = BytesInput.from(cbaos).toByteArray();
+      assertThat(bytes).hasSize(16);
+      assertThat(readLongLE(bytes, 0)).isEqualTo(0x0102030405060708L);
+      assertThat(readLongLE(bytes, 8)).isEqualTo(0x1112131415161718L);
+    }
+  }
+
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  public void testWriteToUsesRecordedSizeWhenSlabPositionIsRewound(boolean direct) throws Throwable {
+    ByteBufferAllocator inner = direct ? new DirectByteBufferAllocator() : new HeapByteBufferAllocator();
+    try (TrackingByteBufferAllocator tracking = TrackingByteBufferAllocator.wrap(inner);
+        CapacityByteArrayOutputStream cbaos = new CapacityByteArrayOutputStream(8, 1000000, tracking)) {
+      byte[] expected = byteRange(0, 40);
+      for (byte b : expected) {
+        cbaos.write(b);
+      }
+      assertThat(cbaos.size()).isEqualTo(expected.length);
+      assertThat(cbaos.getSlabCount()).isGreaterThan(1);
+
+      List<ByteBuffer> slabs = cbaos.getSlabs();
+      ByteBuffer last = slabs.get(slabs.size() - 1);
+      int originalPos = last.position();
+      last.position(originalPos - 2);
+
+      ByteArrayOutputStream out = new ByteArrayOutputStream();
+      cbaos.writeTo(out);
+      assertThat(out.toByteArray()).isEqualTo(expected);
+
+      ByteBuffer copy = ByteBuffer.allocate(expected.length);
+      cbaos.writeInto(copy);
+      copy.flip();
+      byte[] fromWriteInto = new byte[copy.remaining()];
+      copy.get(fromWriteInto);
+      assertThat(fromWriteInto).isEqualTo(expected);
+    }
+  }
+
+  @Test
+  public void testWriteToUsesRecordedSizeWhenFinishedSlabPositionIsRewound() throws Throwable {
+    try (CapacityByteArrayOutputStream cbaos = newCapacityBAOS(8)) {
+      byte[] expected = byteRange(0, 40);
+      for (byte b : expected) {
+        cbaos.write(b);
+      }
+      List<ByteBuffer> slabs = cbaos.getSlabs();
+      assertThat(slabs.size()).isGreaterThan(2);
+
+      ByteBuffer finished = slabs.get(slabs.size() - 2);
+      finished.position(finished.position() - 4);
+
+      ByteArrayOutputStream out = new ByteArrayOutputStream();
+      cbaos.writeTo(out);
+      assertThat(out.toByteArray()).isEqualTo(expected);
+    }
+  }
+
+  @Test
+  public void testWriteIntoDoesNotMutateSlabs() throws Throwable {
+    try (CapacityByteArrayOutputStream cbaos = newCapacityBAOS(8)) {
+      byte[] expected = byteRange(0, 40);
+      for (byte b : expected) {
+        cbaos.write(b);
+      }
+
+      ByteBuffer first = ByteBuffer.allocate(expected.length);
+      cbaos.writeInto(first);
+      ByteBuffer second = ByteBuffer.allocate(expected.length);
+      cbaos.writeInto(second);
+
+      first.flip();
+      second.flip();
+      byte[] firstBytes = new byte[first.remaining()];
+      first.get(firstBytes);
+      byte[] secondBytes = new byte[second.remaining()];
+      second.get(secondBytes);
+      assertThat(firstBytes).isEqualTo(expected);
+      assertThat(secondBytes).isEqualTo(expected);
     }
   }
 

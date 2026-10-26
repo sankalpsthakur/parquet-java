@@ -62,6 +62,17 @@ public class CapacityByteArrayOutputStream extends OutputStream {
   private ByteBuffer currentSlab;
   private int bytesAllocated = 0;
   private int bytesUsed = 0;
+  /**
+   * Bytes written into {@link #currentSlab}. Independent of {@link ByteBuffer#position()}, which can
+   * be moved without changing the payload (see GH-3712).
+   */
+  private int currentSlabUsed = 0;
+  /**
+   * Bytes written into each completed slab, in slab-list order. The current slab is tracked by
+   * {@link #currentSlabUsed} instead.
+   */
+  private final List<Integer> completedSlabUsed = new ArrayList<>();
+
   private ByteBufferAllocator allocator;
 
   /**
@@ -201,9 +212,14 @@ public class CapacityByteArrayOutputStream extends OutputStream {
 
     LOG.debug("used {} slabs, adding new slab of size {}", slabs.size(), nextSlabSize);
 
+    if (currentSlab != EMPTY_SLAB) {
+      completedSlabUsed.add(currentSlabUsed);
+    }
+
     this.currentSlab = allocator.allocate(nextSlabSize);
     this.currentSlab.order(ByteOrder.LITTLE_ENDIAN);
     this.slabs.add(currentSlab);
+    this.currentSlabUsed = 0;
     this.bytesAllocated = Math.addExact(this.bytesAllocated, nextSlabSize);
   }
 
@@ -213,6 +229,7 @@ public class CapacityByteArrayOutputStream extends OutputStream {
       addSlab(1);
     }
     currentSlab.put((byte) b);
+    currentSlabUsed++;
     bytesUsed = Math.addExact(bytesUsed, 1);
   }
 
@@ -222,14 +239,22 @@ public class CapacityByteArrayOutputStream extends OutputStream {
       throw new IndexOutOfBoundsException(String.format(
           "Given byte array of size %d, with requested length(%d) and offset(%d)", b.length, len, off));
     }
+    if (len == 0) {
+      return;
+    }
     if (len > currentSlab.remaining()) {
       final int length1 = currentSlab.remaining();
-      currentSlab.put(b, off, length1);
+      if (length1 > 0) {
+        currentSlab.put(b, off, length1);
+        currentSlabUsed += length1;
+      }
       final int length2 = len - length1;
       addSlab(length2);
       currentSlab.put(b, off + length1, length2);
+      currentSlabUsed += length2;
     } else {
       currentSlab.put(b, off, len);
+      currentSlabUsed += len;
     }
     bytesUsed = Math.addExact(bytesUsed, len);
   }
@@ -238,39 +263,68 @@ public class CapacityByteArrayOutputStream extends OutputStream {
    * Writes an int in little-endian byte order directly to the underlying slab,
    * bypassing intermediate byte array decomposition. Slabs are set to
    * {@link ByteOrder#LITTLE_ENDIAN} order so {@code putInt} produces the correct encoding.
+   * <p>
+   * If the current slab has fewer than 4 bytes remaining, the int is written as individual
+   * bytes so the current slab is filled rather than leaving a gap. That keeps {@link #setByte}
+   * and serialization aligned with {@link #size()}.
    *
    * @param v the int value to write
    */
   public void writeInt(int v) {
-    if (currentSlab.remaining() < 4) {
-      addSlab(4);
+    if (currentSlab.remaining() >= 4) {
+      currentSlab.putInt(v);
+      currentSlabUsed += 4;
+      bytesUsed = Math.addExact(bytesUsed, 4);
+    } else {
+      write(v);
+      write(v >>> 8);
+      write(v >>> 16);
+      write(v >>> 24);
     }
-    currentSlab.putInt(v);
-    bytesUsed = Math.addExact(bytesUsed, 4);
   }
 
   /**
    * Writes a long in little-endian byte order directly to the underlying slab.
+   * See {@link #writeInt(int)} for slab-boundary handling.
    *
    * @param v the long value to write
    */
   public void writeLong(long v) {
-    if (currentSlab.remaining() < 8) {
-      addSlab(8);
+    if (currentSlab.remaining() >= 8) {
+      currentSlab.putLong(v);
+      currentSlabUsed += 8;
+      bytesUsed = Math.addExact(bytesUsed, 8);
+    } else {
+      write((int) v);
+      write((int) (v >>> 8));
+      write((int) (v >>> 16));
+      write((int) (v >>> 24));
+      write((int) (v >>> 32));
+      write((int) (v >>> 40));
+      write((int) (v >>> 48));
+      write((int) (v >>> 56));
     }
-    currentSlab.putLong(v);
-    bytesUsed = Math.addExact(bytesUsed, 8);
   }
 
+  /**
+   * Copies {@code len} bytes from the start of {@code buf} (index 0), ignoring the buffer's
+   * current {@link ByteBuffer#position()}. Page headers record {@link #size()} ({@code bytesUsed});
+   * a slab position can be lower than the bytes actually stored (GH-3712).
+   */
   private void writeToOutput(OutputStream out, ByteBuffer buf, int len) throws IOException {
+    if (len == 0) {
+      return;
+    }
     if (buf.hasArray()) {
       out.write(buf.array(), buf.arrayOffset(), len);
     } else {
       // The OutputStream interface only takes a byte[], unfortunately this means that a ByteBuffer
       // not backed by a byte array must be copied to fulfil this interface
+      ByteBuffer dup = buf.duplicate();
+      dup.clear();
+      dup.limit(len);
       byte[] copy = new byte[len];
-      buf.flip();
-      buf.get(copy);
+      dup.get(copy);
       out.write(copy);
     }
   }
@@ -283,8 +337,14 @@ public class CapacityByteArrayOutputStream extends OutputStream {
    * @throws IOException if an I/O error occurs.
    */
   public void writeTo(OutputStream out) throws IOException {
-    for (ByteBuffer slab : slabs) {
-      writeToOutput(out, slab, slab.position());
+    int remaining = bytesUsed;
+    for (int i = 0; i < slabs.size(); i++) {
+      int len = slabUsed(i);
+      writeToOutput(out, slabs.get(i), len);
+      remaining -= len;
+    }
+    if (remaining != 0) {
+      throw new IOException("Serialized " + (bytesUsed - remaining) + " bytes but size() is " + bytesUsed);
     }
   }
 
@@ -292,10 +352,23 @@ public class CapacityByteArrayOutputStream extends OutputStream {
    * It is expected that the buffer is large enough to fit the content of this.
    */
   void writeInto(ByteBuffer buffer) {
-    for (ByteBuffer slab : slabs) {
-      slab.flip();
-      buffer.put(slab);
+    for (int i = 0; i < slabs.size(); i++) {
+      int len = slabUsed(i);
+      if (len == 0) {
+        continue;
+      }
+      ByteBuffer dup = slabs.get(i).duplicate();
+      dup.clear();
+      dup.limit(len);
+      buffer.put(dup);
     }
+  }
+
+  private int slabUsed(int index) {
+    if (index < completedSlabUsed.size()) {
+      return completedSlabUsed.get(index);
+    }
+    return currentSlabUsed;
   }
 
   /**
@@ -326,8 +399,10 @@ public class CapacityByteArrayOutputStream extends OutputStream {
       allocator.release(slab);
     }
     this.slabs.clear();
+    this.completedSlabUsed.clear();
     this.bytesAllocated = 0;
     this.bytesUsed = 0;
+    this.currentSlabUsed = 0;
     this.currentSlab = EMPTY_SLAB;
   }
 
@@ -351,14 +426,14 @@ public class CapacityByteArrayOutputStream extends OutputStream {
 
     long seen = 0;
     for (int i = 0; i < slabs.size(); i++) {
-      ByteBuffer slab = slabs.get(i);
-      if (index < seen + slab.limit()) {
-        // ok found index
-        slab.put((int) (index - seen), value);
-        break;
+      int slabLen = slabUsed(i);
+      if (index < seen + slabLen) {
+        slabs.get(i).put((int) (index - seen), value);
+        return;
       }
-      seen += slab.limit();
+      seen += slabLen;
     }
+    throw new IllegalStateException("Failed to locate byte at index " + index);
   }
 
   /**
@@ -376,10 +451,18 @@ public class CapacityByteArrayOutputStream extends OutputStream {
     return slabs.size();
   }
 
+  /**
+   * Visible for tests. The returned list is the live slab list; callers must not release buffers.
+   */
+  List<ByteBuffer> getSlabs() {
+    return slabs;
+  }
+
   ByteBuffer getInternalByteBuffer() {
     if (slabs.size() == 1) {
       ByteBuffer buf = slabs.get(0).duplicate();
-      buf.flip();
+      buf.clear();
+      buf.limit(currentSlabUsed);
       return buf.slice();
     }
     return null;
@@ -391,6 +474,10 @@ public class CapacityByteArrayOutputStream extends OutputStream {
       allocator.release(slab);
     }
     slabs.clear();
+    completedSlabUsed.clear();
+    currentSlabUsed = 0;
+    bytesUsed = 0;
+    currentSlab = EMPTY_SLAB;
     try {
       super.close();
     } catch (IOException e) {
